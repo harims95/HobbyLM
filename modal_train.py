@@ -32,7 +32,8 @@ image = (
 # perturb the training image. torch pinned first so lm-eval doesn't pull a different build.
 eval_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.12.0", "numpy", "tiktoken", "lm-eval==0.4.9.1", "datasets", "huggingface-hub")
+    .pip_install("torch==2.12.0", "numpy", "tiktoken", "lm-eval==0.4.9.1",
+                 "transformers==4.48.3", "datasets", "huggingface-hub")  # transformers<5 (lm-eval needs Vision2Seq)
     .add_local_dir(".", "/root/moe-lab")
 )
 
@@ -197,7 +198,7 @@ def lm_eval_run(run_name: str, ckpt: str = "model.pt", tasks: str = EVAL_TASKS,
     import os, sys, json
     os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
     import torch
-    from lm_eval import simple_evaluate
+    from lm_eval.evaluator import simple_evaluate
     from generate import load_model
     from eval_harness import MoELMWrapper
 
