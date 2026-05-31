@@ -39,6 +39,20 @@ class MoELMWrapper(LM):
     def tok_decode(self, toks: list[int]) -> str:
         return self.enc.decode(toks)
 
+    def _encode_pair(self, context: str, continuation: str):
+        """Match lm-eval's TemplateLM._encode_pair: joint-encode so BPE merges at the
+        context/continuation boundary are respected, and move trailing context whitespace
+        into the continuation. (Encoding the two halves separately mis-tokenizes the seam.)"""
+        if context == "":
+            return [self.eot], self.tok_encode(continuation)
+        n_spaces = len(context) - len(context.rstrip())
+        if n_spaces > 0:
+            continuation = context[-n_spaces:] + continuation
+            context = context[:-n_spaces]
+        whole = self.tok_encode(context + continuation)
+        ctx_enc = self.tok_encode(context)
+        return ctx_enc, whole[len(ctx_enc):]
+
     @property
     def eot_token_id(self) -> int:
         return self.eot
@@ -73,8 +87,7 @@ class MoELMWrapper(LM):
         reqs = []
         for r in requests:
             ctx, cont = r.args
-            ctx_enc = self.tok_encode(ctx) if ctx else [self.eot]
-            cont_enc = self.tok_encode(cont)
+            ctx_enc, cont_enc = self._encode_pair(ctx, cont)
             reqs.append((ctx_enc, cont_enc))
 
         results: list[tuple[float, bool]] = [(0.0, False)] * len(reqs)
@@ -94,8 +107,11 @@ class MoELMWrapper(LM):
             logp = self._logprobs(inputs)
             for j, (i, cont_len, cont_enc) in enumerate(metas):
                 Lj = len(inputs[j])
+                if cont_len == 0:
+                    results[i] = (0.0, True)
+                    continue
                 sl = logp[j, Lj - cont_len:Lj, :]                # (cont_len, vocab) predicting the continuation
-                tgt = torch.tensor(cont_enc[-cont_len:], device=self._device)
+                tgt = torch.tensor(cont_enc[len(cont_enc) - cont_len:], device=self._device)
                 tok_lp = sl.gather(-1, tgt[:, None]).squeeze(-1)
                 ll = float(tok_lp.sum().item())
                 greedy = bool((sl.argmax(-1) == tgt).all().item())
