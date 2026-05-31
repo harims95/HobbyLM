@@ -16,6 +16,126 @@ from config import ModelConfig
 from moe import MoE, SwiGLUWeights
 
 
+# -----------------------------------------------------------------------------
+# FP8 matmul for the lm_head (the single largest GEMM). Adapted from modded-nanogpt
+# (@YouJiacheng): weight stored transposed (in, out) so the gradient w.r.t. the weight
+# lands in the natural layout. Forward in e4m3, backward grad in e5m2. bf16 outputs.
+# Wrapped as a custom op with an explicit autograd rule (torch._scaled_mm is not
+# differentiable on its own).
+
+@torch.library.custom_op("moelab::mm_t", mutates_args=())
+def _mm_t(x: Tensor, w: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor, Tensor]:
+    """y = x @ w with x:(M,in), w:(in,out). Returns (y_bf16, x_f8, w_f8) for backward reuse."""
+    @torch.compile
+    def impl(x: Tensor, w: Tensor):
+        x_f8 = x.div(x_s).to(torch.float8_e4m3fn)
+        w_f8 = w.div(w_s).to(torch.float8_e4m3fn)
+        w_col = w_f8.T.contiguous().T  # _scaled_mm needs column-major B
+        out = torch._scaled_mm(x_f8, w_col, out_dtype=torch.bfloat16,
+                               scale_a=x.new_tensor(x_s, dtype=torch.float32),
+                               scale_b=x.new_tensor(w_s, dtype=torch.float32),
+                               use_fast_accum=True)
+        return out, x_f8, w_f8
+    return impl(x, w)
+
+
+@_mm_t.register_fake
+def _(x: Tensor, w: Tensor, *_):
+    return x @ w, x.to(torch.float8_e4m3fn), w.to(torch.float8_e4m3fn)
+
+
+@torch.library.custom_op("moelab::mm_t_backward", mutates_args=())
+def _mm_t_backward(g: Tensor, x_f8: Tensor, w_f8: Tensor, x_s: float, w_s: float, grad_s: float) -> tuple[Tensor, Tensor]:
+    @torch.compile
+    def impl(g: Tensor, x_f8: Tensor, w_f8: Tensor):
+        x_scale = g.new_tensor(x_s, dtype=torch.float32)
+        w_scale = g.new_tensor(w_s, dtype=torch.float32)
+        g_scale = g.new_tensor(grad_s, dtype=torch.float32)
+        g_f8 = g.div(grad_s).to(torch.float8_e5m2)
+        grad_x = torch._scaled_mm(g_f8, w_f8.T, out_dtype=torch.bfloat16,
+                                  scale_a=g_scale, scale_b=w_scale, use_fast_accum=False)
+        grad_w = torch._scaled_mm(x_f8.T.contiguous(), g_f8.T.contiguous().T, out_dtype=torch.float32,
+                                  scale_a=x_scale, scale_b=g_scale, use_fast_accum=False)
+        return grad_x, grad_w
+    return impl(g, x_f8, w_f8)
+
+
+@_mm_t_backward.register_fake
+def _(g: Tensor, x_f8: Tensor, w_f8: Tensor, *_):
+    return x_f8.to(torch.bfloat16), w_f8.to(torch.float32)
+
+
+def _mm_t_setup(ctx, inputs, output):
+    *_, x_s, w_s, grad_s = inputs
+    _, x_f8, w_f8 = output
+    ctx.save_for_backward(x_f8, w_f8)
+    ctx.scales = (x_s, w_s, grad_s)
+    ctx.set_materialize_grads(False)
+
+
+def _mm_t_bwd(ctx, grad_out: Tensor, *_):
+    x_f8, w_f8 = ctx.saved_tensors
+    x_s, w_s, grad_s = ctx.scales
+    gx, gw = torch.ops.moelab.mm_t_backward(grad_out, x_f8, w_f8, x_s, w_s, grad_s)
+    return gx, gw, None, None, None
+
+
+_mm_t.register_autograd(_mm_t_bwd, setup_context=_mm_t_setup)
+
+
+class FP8Linear(nn.Module):
+    """Bias-free linear with FP8 matmul in training (CUDA) and a bf16 fallback elsewhere.
+    Weight is stored transposed (in_features, out_features)."""
+    def __init__(self, in_features: int, out_features: int, x_s=1.0, w_s=1.0, grad_s=1.0):
+        super().__init__()
+        self.in_features, self.out_features = in_features, out_features
+        self.x_s, self.w_s, self.grad_s = x_s, w_s, grad_s
+        self.weight = nn.Parameter(torch.empty(in_features, out_features))
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.training and x.is_cuda:
+            flat = x.flatten(0, -2).bfloat16()
+            out = torch.ops.moelab.mm_t(flat, self.weight.bfloat16(), self.x_s, self.w_s, self.grad_s)[0]
+            return out.reshape(*x.shape[:-1], self.out_features)
+        return x @ self.weight.type_as(x)
+
+
+# -----------------------------------------------------------------------------
+# Fused cross-entropy: process the vocab projection in row-chunks under activation
+# checkpointing so the full (T, vocab) fp32 logit tensor is never materialized or
+# saved for backward. Numerically identical to a plain CE + final z-loss.
+
+def _ce_chunk(x_c: Tensor, weight: Tensor, tgt_c: Tensor, softcap: float, tied: bool):
+    logits = (x_c @ weight.T) if tied else (x_c @ weight)   # tied: weight (V,d); fp8 head: weight (d,V)
+    if softcap > 0:
+        logits = softcap * torch.tanh(logits / softcap)
+    logits = logits.float()
+    lse = torch.logsumexp(logits, dim=-1)                   # (c,)
+    z_sum = (lse * lse).sum()
+    valid = (tgt_c != -1)
+    tgt_logit = logits.gather(-1, tgt_c.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    ce_sum = ((lse - tgt_logit) * valid).sum()
+    return ce_sum, z_sum
+
+
+def fused_cross_entropy(x: Tensor, weight: Tensor, targets: Tensor, *,
+                        z_coef: float, softcap: float, chunk: int, tied: bool):
+    """Returns (loss = mean_ce + z_coef * mean(lse^2), z_mean.detach()). Memory-light."""
+    from torch.utils.checkpoint import checkpoint
+    T = x.shape[0]
+    n_valid = (targets != -1).sum().clamp_min(1)
+    ce_sum = x.new_zeros((), dtype=torch.float32)
+    z_sum = x.new_zeros((), dtype=torch.float32)
+    for i in range(0, T, chunk):
+        c_ce, c_z = checkpoint(_ce_chunk, x[i:i + chunk], weight, targets[i:i + chunk],
+                               softcap, tied, use_reentrant=False)
+        ce_sum = ce_sum + c_ce
+        z_sum = z_sum + c_z
+    ce = ce_sum / n_valid
+    z_mean = z_sum / T
+    return ce + z_coef * z_mean, z_mean.detach()
+
+
 def rms_norm(x: Tensor, weight: Tensor | None = None, eps: float = 1e-6) -> Tensor:
     out = F.rms_norm(x, (x.size(-1),), eps=eps)
     return out * weight if weight is not None else out
@@ -113,11 +233,22 @@ class MoETransformer(nn.Module):
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.blocks = nn.ModuleList([Block(cfg, i) for i in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.d_model)
-        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if cfg.tie_embeddings:
-            self.lm_head.weight = self.embed.weight
+        # FP8 head must be untied (it stores the weight transposed, (d, vocab), for fp8 grad layout).
+        self.fp8_head = cfg.fp8_head
+        if cfg.fp8_head:
+            self.lm_head = FP8Linear(cfg.d_model, cfg.vocab_size,
+                                     x_s=cfg.fp8_x_scale, w_s=cfg.fp8_w_scale, grad_s=cfg.fp8_grad_scale)
+        else:
+            self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+            if cfg.tie_embeddings:
+                self.lm_head.weight = self.embed.weight
         self._rope_cache: dict = {}
         self.apply(self._init)
+        if cfg.fp8_head:
+            # start the untied head from the (tied) embedding weights so the ablation isolates fp8,
+            # not a different head initialization.
+            with torch.no_grad():
+                self.lm_head.weight.copy_(self.embed.weight.t())
         self._scale_residual_init()
 
     # ---- init ----
@@ -166,16 +297,33 @@ class MoETransformer(nn.Module):
             x, aux = blk(x, cos, sin)
             aux_sum = aux_sum + aux
         x = self.final_norm(x)
-        logits = self.lm_head(x)
-        if self.cfg.logit_softcap > 0:
-            sc = self.cfg.logit_softcap
-            logits = sc * torch.tanh(logits / sc)
+        cfg = self.cfg
+        sc = cfg.logit_softcap
+
+        # ---- inference: return logits ----
         if targets is None:
+            logits = self.lm_head(x)
+            if sc > 0:
+                logits = sc * torch.tanh(logits / sc)
             return logits, aux_sum
+
+        # ---- training: compute loss ----
+        if cfg.fused_ce and not cfg.fp8_head:
+            # chunked CE on the tied weight (V, d); never materializes the full fp32 logits.
+            loss_cez, z = fused_cross_entropy(
+                x.reshape(-1, x.size(-1)), self.lm_head.weight, targets.reshape(-1),
+                z_coef=cfg.final_z_loss_coef, softcap=sc, chunk=cfg.ce_chunk, tied=True)
+            loss = loss_cez + aux_sum
+            ce = (loss_cez - cfg.final_z_loss_coef * z).detach()
+            return loss, {"ce": ce, "aux": aux_sum.detach(), "z": z}
+
+        logits = self.lm_head(x)                       # fp8 head -> bf16, else nn.Linear
+        if sc > 0:
+            logits = sc * torch.tanh(logits / sc)
         logits = logits.float()
         ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         z = (torch.logsumexp(logits, dim=-1) ** 2).mean()
-        loss = ce + self.cfg.final_z_loss_coef * z + aux_sum
+        loss = ce + cfg.final_z_loss_coef * z + aux_sum
         return loss, {"ce": ce.detach(), "aux": aux_sum.detach(), "z": z.detach()}
 
     @torch.no_grad()
@@ -200,8 +348,10 @@ class MoETransformer(nn.Module):
 def count_params(model: MoETransformer) -> dict:
     cfg = model.cfg
     total = sum(p.numel() for p in model.parameters())
-    # subtract tied head double-count is already avoided (shared weight counted once)
-    embed = cfg.vocab_size * cfg.d_model * (1 if cfg.tie_embeddings else 2)
+    # subtract tied head double-count is already avoided (shared weight counted once).
+    # fp8_head forces an untied head, so it costs a second vocab x d_model matrix.
+    tied = cfg.tie_embeddings and not cfg.fp8_head
+    embed = cfg.vocab_size * cfg.d_model * (1 if tied else 2)
     # active = total - inactive routed experts. Per MoE layer, only top_k of n_experts run.
     per_expert = cfg.d_model * 2 * cfg.expert_ffn + cfg.expert_ffn * cfg.d_model
     inactive_per_moe = (cfg.n_experts - cfg.top_k) * per_expert

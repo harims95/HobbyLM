@@ -50,6 +50,13 @@ class ModelConfig:
     init_std: float = 0.02
     # ---- impl ----
     expert_backend: Literal["grouped", "bmm", "loop"] = "grouped"  # grouped=GPU fast; bmm/loop=CPU-testable ref
+    # ---- throughput opts (nanogpt-inspired; see docs/ARCHITECTURE_RESEARCH.md §8) ----
+    fused_ce: bool = False             # chunked cross-entropy: never materialize the full (T,vocab) fp32 logits
+    ce_chunk: int = 4096               # rows per CE chunk (fused_ce only)
+    fp8_head: bool = False             # FP8 (torch._scaled_mm) lm_head; UNTIES the head (own d x vocab weight)
+    fp8_x_scale: float = 1.0           # fp8 activation/weight/grad scales (pre-head x is ~unit RMS, so 1.0 is safe)
+    fp8_w_scale: float = 1.0
+    fp8_grad_scale: float = 1.0
 
     def __post_init__(self):
         assert self.n_q_heads % self.n_kv_heads == 0, "n_q_heads must be divisible by n_kv_heads"
@@ -83,6 +90,7 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_wd: float = 0.1
     muon_ns_steps: int = 5
+    orthogonalizer: Literal["ns5", "polar"] = "ns5"  # ns5=Newton-Schulz (baseline); polar=Polar Express schedule
     adam_lr: float = 3e-4
     adam_betas: tuple = (0.9, 0.95)
     adam_wd: float = 0.1

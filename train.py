@@ -15,12 +15,15 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+# Reduce allocator fragmentation (lets us fit a larger batch); must be set before importing torch.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from config import TrainConfig, get_config
-from data import data_generator
+from data import data_generator, CUDAPrefetcher
 from model import MoETransformer, count_params
 from optim import build_optimizers
 
@@ -61,6 +64,8 @@ def main():
     ap.add_argument("--out_dir", default="runs")
     ap.add_argument("--save_every", type=int, default=0, help="save a checkpoint every N steps (0=only final)")
     ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--orthogonalizer", default="ns5", choices=["ns5", "polar"],
+                    help="Muon orthogonalizer: ns5 (Newton-Schulz) or polar (Polar Express)")
     ap.add_argument("--set", nargs="*", default=[], help="model config overrides key=value")
     args = ap.parse_args()
 
@@ -85,7 +90,8 @@ def main():
     tc = TrainConfig(seq_len=args.seq_len, batch_tokens=args.batch_tokens,
                      micro_batch_seqs=args.micro_batch_seqs, max_steps=args.max_steps,
                      val_every=args.val_every, run_name=args.run_name,
-                     out_dir=args.out_dir, compile=not args.no_compile)
+                     out_dir=args.out_dir, compile=not args.no_compile,
+                     orthogonalizer=args.orthogonalizer)
     torch.manual_seed(tc.seed + rank)
     torch.set_float32_matmul_precision("high")  # TF32 for fp32 matmuls (router/embed)
 
@@ -124,7 +130,9 @@ def main():
     B, S = tc.micro_batch_seqs, tc.seq_len
     tokens_per_micro = B * S * world
     accum = max(1, tc.batch_tokens // tokens_per_micro)
-    train_gen = data_generator(str(Path(args.data_dir) / "fineweb_train_*.bin"), B, S, device, rank, world)
+    train_gen = data_generator(str(Path(args.data_dir) / "fineweb_train_*.bin"), B, S, device,
+                               rank, world, to_device=False)
+    train_prefetch = CUDAPrefetcher(train_gen, device)   # overlaps H2D copy with compute
     val_pattern = str(Path(args.data_dir) / "fineweb_val_*.bin")
     log(f"batch_tokens={tc.batch_tokens} micro=({B}x{S})x{world} accum={accum} "
         f"lr_scale={lr_scale:.2f} muon_lr={tc.muon_lr:.4f} adam_lr={tc.adam_lr:.2e}")
@@ -173,15 +181,17 @@ def main():
             raw_model.set_bias_update_rate(0.0)
             log(f"step {step}: froze aux-free expert bias")
 
-        loss_accum = 0.0
+        # accumulate the loss on-device; only sync to host when we actually log (avoids a
+        # device->host stall every micro-step that would serialize the accumulation loop).
+        loss_accum = torch.zeros((), device=device)
         for micro in range(accum):
-            x, y = next(train_gen)
+            x, y = train_prefetch.next()
             sync_ctx = model.no_sync() if (ddp and micro < accum - 1) else nullcontext()
             with sync_ctx:
                 with amp:
-                    loss, parts = model(x, y)
+                    loss, _ = model(x, y)
                 (loss / accum).backward()
-            loss_accum += loss.item() / accum
+            loss_accum += loss.detach() / accum
 
         torch.nn.utils.clip_grad_norm_(raw_model.parameters(), tc.grad_clip)
         muon.step(); adamw.step()
@@ -191,7 +201,7 @@ def main():
 
         if step % tc.log_every == 0:
             dt = (time.time() - t0) / (step + 1)
-            log(f"step {step:5d} | loss {loss_accum:.4f} | lr {tc.muon_lr*m:.4f} | {dt*1000:.0f}ms/step")
+            log(f"step {step:5d} | loss {loss_accum.item():.4f} | lr {tc.muon_lr*m:.4f} | {dt*1000:.0f}ms/step")
         if tc.val_every and (step + 1) % tc.val_every == 0:
             vl = evaluate()
             log(f"  >> val loss {vl:.4f} @ step {step+1}")
