@@ -55,6 +55,11 @@ MoE as the LLM. Decisions locked 2026-05-31.
   (LLM 2e-5 / proj 1e-4) warmup+cosine, loss masked to assistant turns. **8×H100, micro 8, 1500 steps (~0.6 epoch,
   ~13 min): loss 2.64→1.9.** `500M_vlm_stage2/model.pt`. Test: `--action caption --stage2_run 500M_vlm_stage2`
   (USER:/ASSISTANT: chat format). Eval: VQAv2 / GQA / TextVQA / POPE (TODO).
+- **Phase 1 — quality pass (2026-06-01).** Diagnosed the stage-2 "repetition/hallucination": **repetition was a
+  pure DECODING artifact** → fixed FREE with rep-penalty(1.3)+no-repeat-3gram in `caption` (no retrain; "white white
+  car" loops → clean 7/8). Residual **hallucination** (hard images, e.g. banknote→"building") is data/scale-limited →
+  **full-epoch retrain** (2500 steps = 1 epoch, the standard SFT length; >1 risks overfit): loss→1.58 (vs 0.6-ep 1.9).
+  Real levers for more: full 665K mix (~50GB) or 1B backbone.
 - **Phase 2 — (folded into 0)** full 729 tokens at 2048 ctx.
 - **Phase 3 — audio:** CLAP/BEATs encoder + AudioCaps/Clotho data + projector; joint image+audio SFT.
 - **Phase 4 (optional, novel) — MoE modality experts** ablation.
