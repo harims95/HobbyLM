@@ -204,6 +204,22 @@ def _pick_metric(task: str, metrics: dict):
     return (k.split(",")[0], metrics[k]) if k else (None, None)
 
 
+def _summarize(res: dict, requested: list) -> dict:
+    """task -> score*100, only for the REQUESTED top-level tasks. Grouped tasks (e.g. mmlu has 57
+    subtasks) report just the group aggregate, not every subtask."""
+    results = res.get("results", {})
+    groups = res.get("groups", {})
+    out = {}
+    for t in requested:
+        m = results.get(t) or groups.get(t)
+        if not m:
+            continue
+        base, val = _pick_metric(t, m)
+        if base is not None and val is not None:
+            out[t] = round(100 * float(val), 2)
+    return out
+
+
 # reference open models across sizes for an apples-to-apples comparison (run through OUR harness).
 # (name -> (hf_id, approx total params, pretrain tokens) for the annotated table)
 REF_MODELS = {
@@ -252,15 +268,11 @@ def hf_eval(name: str, model_id: str, tasks: str = EVAL_TASKS_7,
     from lm_eval.evaluator import simple_evaluate
     dtype = "bfloat16" if torch.cuda.is_available() else "float32"
     print(f"[hf_eval] {name} ({model_id})", flush=True)
+    requested = [t for t in tasks.split(",") if t]
     res = simple_evaluate(model="hf",
                           model_args=f"pretrained={model_id},dtype={dtype},trust_remote_code=True",
-                          tasks=[t for t in tasks.split(",") if t],
-                          limit=(limit or None), num_fewshot=num_fewshot, batch_size=batch_size)
-    summary = {}
-    for task, metrics in res["results"].items():
-        base, val = _pick_metric(task, metrics)
-        if base is not None and val is not None:
-            summary[task] = round(100 * float(val), 2)
+                          tasks=requested, limit=(limit or None), num_fewshot=num_fewshot, batch_size=batch_size)
+    summary = _summarize(res, requested)
     avg = round(sum(summary.values()) / len(summary), 2) if summary else None
     print(f"[hf_eval] {name}: {summary} avg={avg}", flush=True)
     return {"name": name, "model_id": model_id, "scores": summary, "avg": avg}
@@ -291,33 +303,22 @@ def lm_eval_run(run_name: str, ckpt: str = "model.pt", tasks: str = EVAL_TASKS,
                           limit=(limit or None), num_fewshot=num_fewshot, batch_size=batch_size)
 
     # ---- print a clean table + persist results.json next to the checkpoint ----
+    # only report the requested top-level tasks (grouped tasks like mmlu would otherwise dump 57 subtasks)
+    scores = _summarize(res, task_list)              # task -> value*100
     print(f"\n=== lm-eval [{run_name}] ({num_fewshot}-shot, limit={limit or 'full'}) ===", flush=True)
-    print(f"{'task':>16} | {'metric':>10} | {'value':>7} | {'stderr':>7}")
-    print("-" * 50)
+    print(f"{'task':>16} | {'value':>7}")
+    print("-" * 28)
     summary = {}
-    for task, metrics in sorted(res["results"].items()):
-        # prefer acc_norm where present, else acc, else first metric
-        pick = None
-        for key in ("acc_norm,none", "acc,none", "acc_norm", "acc"):
-            if key in metrics:
-                pick = key
-                break
-        if pick is None:
-            pick = next((k for k in metrics if not k.endswith("_stderr") and k != "alias"), None)
-        if pick is None:
+    for task in task_list:
+        if task not in scores:
             continue
-        val = metrics[pick]
-        stderr = metrics.get(pick.replace(",none", "_stderr,none"), metrics.get(pick + "_stderr", float("nan")))
-        base = pick.split(",")[0]
-        summary[task] = {base: val}
-        try:
-            print(f"{task:>16} | {base:>10} | {val:>7.4f} | {float(stderr):>7.4f}", flush=True)
-        except (ValueError, TypeError):
-            print(f"{task:>16} | {base:>10} | {val:>7.4f} |     n/a", flush=True)
-    accs = [list(v.values())[0] for v in summary.values()]
-    if accs:
-        print("-" * 50)
-        print(f"{'AVERAGE':>16} | {'':>10} | {sum(accs)/len(accs):>7.4f} |", flush=True)
+        m = res["results"].get(task) or res.get("groups", {}).get(task, {})
+        base, _ = _pick_metric(task, m)
+        summary[task] = {base: scores[task] / 100.0}
+        print(f"{task:>16} | {scores[task]:>7.2f}", flush=True)
+    if scores:
+        print("-" * 28)
+        print(f"{'AVERAGE':>16} | {sum(scores.values())/len(scores):>7.2f}", flush=True)
 
     out = {"run": run_name, "step": step, "val_loss": val_loss, "num_fewshot": num_fewshot,
            "limit": limit, "results": res["results"]}
