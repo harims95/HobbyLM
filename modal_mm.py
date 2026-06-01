@@ -12,7 +12,8 @@ import modal
 vlm_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.12.0", "transformers>=4.50,<5", "pillow", "numpy",
-                 "huggingface-hub", "accelerate", "sentencepiece", "tiktoken")
+                 "huggingface-hub", "accelerate", "sentencepiece", "tiktoken",
+                 "soundfile", "librosa")   # librosa/soundfile for audio (Phase 3)
     .env({"HF_HUB_DISABLE_XET": "1", "HF_HOME": "/cache/hf"})
     .add_local_dir(".", "/root/moe-lab")
 )
@@ -118,6 +119,43 @@ def smoke():
           f"backbone frozen? (grad on embed={llm.embed.weight.grad is not None})", flush=True)
     assert torch.isfinite(loss) and torch.isfinite(g).all()
     print("VISION SMOKE OK", flush=True)
+
+
+@app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/cache/hf": hf_cache},
+              timeout=30 * 60, secrets=[HF])
+def audio_smoke():
+    """End-to-end audio path on synthetic audio: CLAP -> project -> splice <audio> -> 500M backbone -> loss/grad."""
+    import os, sys, numpy as np, torch
+    os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
+    import tiktoken
+    from audio import ClapAudio, CLAP_SR
+    from multimodal import MoEVLM, AUDIO_TOKEN
+    from generate import load_model
+
+    dev = torch.device("cuda")
+    torch.manual_seed(0)
+    enc = ClapAudio(device=dev)
+    wav = (np.random.randn(CLAP_SR * 5).astype("float32")) * 0.1     # 5s of synthetic mono audio
+    feats = enc.encode([wav])                                        # (1, T, hidden)
+    print(f"CLAP hidden={enc.hidden}  features={tuple(feats.shape)}", flush=True)
+
+    llm, cfg, vloss, _ = load_model(BACKBONE, dev)
+    print(f"backbone {BACKBONE}: d{cfg.d_model} val={vloss}", flush=True)
+    llm.train()
+    vlm = MoEVLM(llm, vision_dim=1152, audio_dim=enc.hidden).to(dev)
+    tok = tiktoken.get_encoding("gpt2")
+    cap = tok.encode_ordinary("the sound of rain falling")
+    logical = [AUDIO_TOKEN] + cap + [50256]                          # [<audio>] caption <eot>
+    ids = torch.tensor([logical[:-1]], device=dev)
+    tgt = torch.tensor([logical[1:]], device=dev)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss, parts = vlm(ids, audio_features=feats, targets=tgt)
+    loss.backward()
+    g = vlm.audio_projector.net[0].weight.grad
+    print(f"merged len={feats.shape[1] + len(cap)}  loss={loss.item():.4f}  "
+          f"audio-projector grad finite={bool(torch.isfinite(g).all())}", flush=True)
+    assert torch.isfinite(loss) and torch.isfinite(g).all()
+    print("AUDIO SMOKE OK", flush=True)
 
 
 @app.function(image=vlm_image, gpu="H100:8", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
@@ -245,6 +283,8 @@ def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: floa
         download_sft.remote()
     elif action == "smoke":
         smoke.remote()
+    elif action == "audio_smoke":
+        audio_smoke.remote()
     elif action == "stage1":
         train_stage1.remote(max_steps=max_steps, micro=micro, lr=lr)
     elif action == "stage2":
