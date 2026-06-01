@@ -112,13 +112,69 @@ def train_stage1(max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, save_
     return {"out": out, "steps": max_steps}
 
 
+@app.function(image=vlm_image, gpu="H100", volumes={"/data": runs_vol, "/llava": data_vol, "/cache/hf": hf_cache},
+              timeout=30 * 60, secrets=[HF])
+def caption(stage1_run: str = "500M_vlm_stage1", n: int = 8, max_new: int = 32, prompt: str = ""):
+    """Greedy-caption a few real LAION images with the stage-1 VLM; print predicted vs ground-truth."""
+    import os, sys, io, json, zipfile, torch
+    os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
+    from PIL import Image
+    import tiktoken
+    from vision import SiglipVision
+    from multimodal import MoEVLM, IMAGE_TOKEN
+    from generate import load_model, GPT2_VALID, EOT
+
+    dev = torch.device("cuda")
+    enc = SiglipVision(device=dev)
+    llm, cfg, _, _ = load_model(BACKBONE, dev)
+    vlm = MoEVLM(llm, vision_dim=enc.hidden).to(dev)
+    ck = torch.load(f"/data/runs/{stage1_run}/projector.pt", map_location=dev, weights_only=False)
+    vlm.mm_projector.load_state_dict(ck["projector"])
+    vlm.eval()
+    print(f"loaded projector (steps={ck.get('steps')})", flush=True)
+
+    tok = tiktoken.get_encoding("gpt2")
+    data = json.load(open("/llava/blip_laion_cc_sbu_558k.json"))
+    z = zipfile.ZipFile("/llava/images.zip")
+    pre = tok.encode_ordinary(prompt) if prompt else []
+
+    @torch.no_grad()
+    def gen(image):
+        feats = enc.encode([image])
+        ids = torch.tensor([[IMAGE_TOKEN] + pre], device=dev)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            cur, _ = vlm.build_inputs_embeds(ids, image_features=feats)
+            outs = []
+            for _ in range(max_new):
+                logits, _ = vlm.llm(inputs_embeds=cur)
+                lg = logits[:, -1, :].float()
+                lg[:, GPT2_VALID:] = -float("inf")
+                t = int(lg.argmax(-1).item())
+                if t == EOT:
+                    break
+                outs.append(t)
+                e = vlm.llm.embed(torch.tensor([[t]], device=dev)).to(cur.dtype)
+                cur = torch.cat([cur, e], dim=1)
+        return tok.decode(outs)
+
+    for k in range(n):
+        i = (k * 69779) % len(data)                    # deterministic spread across the set
+        ex = data[i]
+        img = Image.open(io.BytesIO(z.read(ex["image"]))).convert("RGB")
+        gt = ex["conversations"][1]["value"].strip().replace("\n", " ")[:90]
+        print(f"\n[{ex['image']}]\n   GT:   {gt}\n   PRED: {gen(img).strip()}", flush=True)
+    print("\nCAPTION DONE", flush=True)
+
+
 @app.local_entrypoint()
-def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3):
+def main(action: str = "smoke", max_steps: int = 1500, micro: int = 32, lr: float = 1e-3, n: int = 8):
     if action == "download":
         download.remote()
     elif action == "smoke":
         smoke.remote()
     elif action == "stage1":
         train_stage1.remote(max_steps=max_steps, micro=micro, lr=lr)
+    elif action == "caption":
+        caption.remote(n=n)
     else:
         raise SystemExit(f"unknown action {action!r} (use download|smoke|stage1)")
