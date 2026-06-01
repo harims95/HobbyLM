@@ -84,7 +84,7 @@ class MoEVLM(nn.Module):
             e_parts, t_parts, prev = [], [], 0
             for pos, feat in spots:
                 e_parts.append(text_emb[prev:pos])
-                e_parts.append(feat)
+                e_parts.append(feat.to(text_emb.dtype))   # encoder/projector may be bf16 under autocast
                 if targets is not None:
                     t_parts.append(targets[b][prev:pos])
                     t_parts.append(torch.full((feat.shape[0],), IGNORE_INDEX, dtype=targets.dtype, device=dev))

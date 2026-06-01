@@ -107,6 +107,22 @@ def test_mixed_batch():
     print(f"    loss={loss.item():.4f}  OK")
 
 
+def test_dtype_mismatch():
+    print("[6] under autocast (projector bf16 vs embed fp32) the cat still works")
+    torch.manual_seed(4)
+    VIS, NI = 1152, 6
+    vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=VIS)
+    ids = torch.tensor([[5, IMAGE_TOKEN, 6, 7]])
+    tgt = torch.randint(0, 50257, ids.shape)
+    feats = torch.randn(1, NI, VIS)
+    with torch.autocast("cpu", dtype=torch.bfloat16):   # projector->bf16, embed stays fp32
+        embeds, _ = vlm.build_inputs_embeds(ids, image_features=feats, targets=tgt)
+        loss, _ = vlm(ids, image_features=feats, targets=tgt)
+    print(f"    merged shape={tuple(embeds.shape)}  loss={loss.item():.4f}")
+    assert embeds.shape[1] == 4 - 1 + NI and torch.isfinite(loss)
+    print("    OK")
+
+
 def test_stage1_freeze():
     print("[5] stage-1 freeze: only projector trains")
     vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=1152)
@@ -123,5 +139,6 @@ if __name__ == "__main__":
     test_image_splice()
     test_audio_and_both()
     test_mixed_batch()
+    test_dtype_mismatch()
     test_stage1_freeze()
     print("\nALL VLM PLUMBING TESTS PASSED")
