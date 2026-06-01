@@ -87,7 +87,11 @@ class MoEVLM(nn.Module):
                 e_parts.append(feat.to(text_emb.dtype))   # encoder/projector may be bf16 under autocast
                 if targets is not None:
                     t_parts.append(targets[b][prev:pos])
-                    t_parts.append(torch.full((feat.shape[0],), IGNORE_INDEX, dtype=targets.dtype, device=dev))
+                    # next-token: the LAST feature predicts the token following the sentinel (no internal
+                    # label shift in our model), so carry targets[pos] onto it; the rest are ignored.
+                    ft = torch.full((feat.shape[0],), IGNORE_INDEX, dtype=targets.dtype, device=dev)
+                    ft[-1] = targets[b][pos]
+                    t_parts.append(ft)
                 prev = pos + 1
             e_parts.append(text_emb[prev:])
             if targets is not None:

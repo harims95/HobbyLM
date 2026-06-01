@@ -58,8 +58,8 @@ def test_image_splice():
     assert embeds.shape == (2, expect_len, vlm.d_model)
     # the NI image positions must be IGNORE_INDEX
     n_ignored = (new_tgt == IGNORE_INDEX).sum(dim=1)
-    print(f"    ignored targets/sample={n_ignored.tolist()} (expect >= {NI})")
-    assert (n_ignored >= NI).all()
+    print(f"    ignored targets/sample={n_ignored.tolist()} (expect >= {NI - 1}; last feat carries a target)")
+    assert (n_ignored >= NI - 1).all()
     loss, parts = vlm(ids, image_features=feats, targets=tgt)
     loss.backward()
     g = vlm.mm_projector.net[0].weight.grad
@@ -81,7 +81,7 @@ def test_audio_and_both():
     expect = ids.shape[1] - 2 + NI + NA
     print(f"    merged len={embeds.shape[1]} (expect {expect})  ignored={(new_tgt==IGNORE_INDEX).sum().item()}")
     assert embeds.shape[1] == expect
-    assert (new_tgt == IGNORE_INDEX).sum().item() >= NI + NA
+    assert (new_tgt == IGNORE_INDEX).sum().item() >= NI + NA - 2   # last feat of each block carries a target
     loss, _ = vlm(ids, image_features=img, audio_features=aud, targets=tgt)
     assert torch.isfinite(loss)
     print(f"    loss={loss.item():.4f}  OK")
@@ -123,6 +123,22 @@ def test_dtype_mismatch():
     print("    OK")
 
 
+def test_target_alignment():
+    print("[7] next-token alignment: last image feature predicts the first post-image token")
+    VIS, NI = 1152, 5
+    vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=VIS)
+    c0, c1, eot = 100, 200, 50256
+    # logical seq = [IMAGE, c0, c1, eot]; input = logical[:-1], target = logical[1:]
+    ids = torch.tensor([[IMAGE_TOKEN, c0, c1]])
+    tgt = torch.tensor([[c0, c1, eot]])
+    feats = torch.randn(1, NI, VIS)
+    _, new_tgt = vlm.build_inputs_embeds(ids, image_features=feats, targets=tgt)
+    nt = new_tgt[0].tolist()
+    print(f"    new_targets={nt}")
+    assert nt == [IGNORE_INDEX] * (NI - 1) + [c0, c1, eot]
+    print("    OK (last feature target=c0, then c1, eot)")
+
+
 def test_stage1_freeze():
     print("[5] stage-1 freeze: only projector trains")
     vlm = MoEVLM(MoETransformer(tiny_cfg()), vision_dim=1152)
@@ -140,5 +156,6 @@ if __name__ == "__main__":
     test_audio_and_both()
     test_mixed_batch()
     test_dtype_mismatch()
+    test_target_alignment()
     test_stage1_freeze()
     print("\nALL VLM PLUMBING TESTS PASSED")
