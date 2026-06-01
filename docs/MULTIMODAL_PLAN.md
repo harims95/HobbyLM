@@ -1,0 +1,51 @@
+# Multimodal MoE (Image + Audio) — Plan
+
+Turn the MoE base LLM into a **TinyLLaVA-style** vision-language model (then add audio), using our
+MoE as the LLM. Decisions locked 2026-05-31.
+
+## Locked decisions
+| piece | choice |
+|---|---|
+| LLM (target) | **MoE 500M** (`500M_40B`, val 3.03); 1B later |
+| Vision encoder | `google/siglip2-so400m-patch14-384` (~400M), **frozen**, full ~729 tokens |
+| Context | **extend 500M 1024 → 2048 first** (RoPE), so 729 img + text fits |
+| Connector | 2-layer MLP projector (GELU), TinyLLaVA default — trainable |
+| Stage 1 (align) | LAION-CC-SBU-558K, **projector only** |
+| Stage 2 (SFT) | TinyLLaVA_Factory full mix, projector + LLM |
+| Audio (Phase 3) | **CLAP/BEATs** encoder (general audio), frozen + projector |
+| Special tokens | reuse free vocab slots 50257–50303 (`<image>`,`<audio>`,`<im_start/end>`) — no tokenizer change |
+
+## Key engineering facts / gotchas
+- **Context is the gating constraint.** SigLIP2-so400m-384 ≈ 729 tokens > half of 1024 → must extend to 2048.
+- **Precompute & cache frozen encoder features** to a Modal volume (vision frozen in BOTH stages) → training
+  never runs the 400M ViT; stage 1 becomes ~free. Same for audio. (Big efficiency win; matches our ethos.)
+- **MoE bonus:** router sees visual tokens too — log expert usage on image vs text tokens; on-ramp to
+  *modality experts* (Phase 4) for ~free.
+- **Audio data gap:** LAION/TinyLLaVA are image-only; audio needs its own data (AudioCaps/Clotho) + encoder
+  + a 3rd training stage. Phase it after vision.
+
+## Code changes to `MoETransformer` / harness
+1. `forward(input_ids=None, inputs_embeds=None, ...)` — accept precomputed embeds for splicing.
+2. **`MoEVLM` wrapper** (new file): text-embed → encoders+projectors (or load cached feats) → replace
+   `<image>`/`<audio>` placeholder embeddings → call LLM.
+3. **Checkpoint-resume in `train.py`** (needed first, for context extension): load weights + continue.
+4. RoPE: 1D positions for image/audio tokens to start; 2D/M-RoPE is a later upgrade.
+
+## Roadmap
+- **Phase 0 — context extension (CRITICAL PATH, first):** add ckpt-resume to train.py; continued-pretrain
+  `500M_40B` at `seq_len=2048` on FineWeb (~1–3B tokens; θ=1e4→~4e4 or NTK). Validate ppl holds at 2048.
+- **Phase 0.5 — VLM plumbing:** `forward(inputs_embeds)`, `MoEVLM`, special tokens, CPU splice unit-test.
+- **Phase 1 — vision:** download LAION-558K; precompute SigLIP2 feats → volume; stage-1 projector;
+  stage-2 SFT on TinyLLaVA mix. Eval: VQAv2 / GQA / TextVQA / POPE.
+- **Phase 2 — (folded into 0)** full 729 tokens at 2048 ctx.
+- **Phase 3 — audio:** CLAP/BEATs encoder + AudioCaps/Clotho data + projector; joint image+audio SFT.
+- **Phase 4 (optional, novel) — MoE modality experts** ablation.
+
+## Compute (Modal, 8×H100)
+- Context extension: a few hours (~1–3B tokens at 2048).
+- Stage 1 (cached feats, projector only): minutes–~1h.
+- Stage 2 SFT (~1.2M samples, LLM unfrozen): a few hours at 500M.
+- Biggest effort = **data engineering** (TinyLLaVA mix = COCO/GQA/OCR-VQA/TextVQA/VG, hundreds of GB).
+
+## Eval
+VQAv2, GQA, TextVQA, **POPE** (hallucination), MME, COCO CIDEr — via lm-eval multimodal tasks.
