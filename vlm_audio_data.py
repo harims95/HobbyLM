@@ -17,35 +17,70 @@ EOT = 50256
 
 
 class ClothoAudio(Dataset):
-    def __init__(self, repo: str = "CLAPv2/Clotho", split: str | None = None, sr: int = 48000, max_cap: int = 64):
-        from datasets import load_dataset, Audio
-        dd = load_dataset(repo)
-        if split is None:
-            split = "train" if "train" in dd else list(dd.keys())[0]
-        ds = dd[split]
-        cols = ds.column_names
-        self.audio_col = next(c for c in cols if "audio" in c.lower())
-        self.cap_col = next(c for c in cols if "cap" in c.lower() or "text" in c.lower())
-        ds = ds.cast_column(self.audio_col, Audio(sampling_rate=sr))
-        self.ds = ds
+    """Reads the HF parquet directly (pyarrow) and decodes embedded audio bytes with soundfile —
+    no `datasets` Audio feature (which pulls torchcodec / breaks across pyarrow versions)."""
+    def __init__(self, repo: str = "CLAPv2/Clotho", sr: int = 48000, max_cap: int = 64):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from huggingface_hub import HfApi, hf_hub_download
+        files = [f for f in HfApi().list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet")]
+        train = [f for f in files if "train" in f.lower()] or files
+        tabs = [pq.read_table(hf_hub_download(repo, f, repo_type="dataset")) for f in sorted(train)]
+        self.table = pa.concat_tables(tabs) if len(tabs) > 1 else tabs[0]
+        names = self.table.column_names
+        self.audio_col = next(c for c in names if "audio" in c.lower())
+        self.cap_col = next(c for c in names if "cap" in c.lower() or "text" in c.lower())
+        self.ac = self.table.column(self.audio_col)
+        self.cc = self.table.column(self.cap_col)
         self.sr = sr
         self.max_cap = max_cap
-        print(f"[ClothoAudio] {repo}:{split} n={len(ds)} audio_col={self.audio_col} cap_col={self.cap_col}", flush=True)
+        print(f"[ClothoAudio] {repo} n={self.table.num_rows} audio_col={self.audio_col} cap_col={self.cap_col}",
+              flush=True)
 
     def __len__(self):
-        return len(self.ds)
+        return self.table.num_rows
+
+    def raw(self, i):
+        """Return (waveform float32 @ self.sr, caption str) for inference/inspection."""
+        import io
+        import numpy as np
+        import soundfile as sf
+        a = self.ac[i].as_py()
+        b = a["bytes"] if isinstance(a, dict) else a
+        wav, sr = sf.read(io.BytesIO(b), dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != self.sr:
+            import librosa
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=self.sr)
+        cap = self.cc[i].as_py()
+        if isinstance(cap, (list, tuple)):
+            cap = cap[0] if cap else ""
+        return np.ascontiguousarray(wav), str(cap)
 
     def __getitem__(self, i):
-        ex = self.ds[i]
-        wav = ex[self.audio_col]["array"]
-        cap = ex[self.cap_col]
+        import io
+        import soundfile as sf
+        import numpy as np
+        a = self.ac[i].as_py()                        # {'bytes':..., 'path':...} or raw bytes
+        b = a["bytes"] if isinstance(a, dict) else a
+        try:
+            wav, sr = sf.read(io.BytesIO(b), dtype="float32")
+            if wav.ndim > 1:
+                wav = wav.mean(axis=1)                 # mono
+            if sr != self.sr:
+                import librosa
+                wav = librosa.resample(wav, orig_sr=sr, target_sr=self.sr)
+        except Exception:
+            wav = np.zeros(self.sr, dtype=np.float32)
+        cap = self.cc[i].as_py()
         if isinstance(cap, (list, tuple)):
             cap = cap[0] if cap else ""
         cap_ids = ENC.encode_ordinary(" " + str(cap).strip())[:self.max_cap] + [EOT]
         logical = [AUDIO_TOKEN] + cap_ids
         ids = torch.tensor(logical[:-1], dtype=torch.long)
         tgt = torch.tensor(logical[1:], dtype=torch.long)
-        return torch.as_tensor(wav, dtype=torch.float32), ids, tgt
+        return torch.as_tensor(np.ascontiguousarray(wav), dtype=torch.float32), ids, tgt
 
 
 def audio_collate(batch):

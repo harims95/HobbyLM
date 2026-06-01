@@ -260,10 +260,7 @@ def caption_audio(audio_run: str = "500M_vlm_audio_stage1", n: int = 8, max_new:
 
     for k in range(n):
         i = (k * 619) % len(ds)
-        ex = ds.ds[i]
-        wav = ex[ds.audio_col]["array"]
-        gt = ex[ds.cap_col]
-        gt = (gt[0] if isinstance(gt, (list, tuple)) else gt)
+        wav, gt = ds.raw(i)
         print(f"\n[{i}] GT:   {str(gt)[:90]}\n     PRED: {gen(wav).strip()}", flush=True)
     print("\nAUDIO CAPTION DONE", flush=True)
 
