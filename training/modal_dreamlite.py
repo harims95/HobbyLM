@@ -474,7 +474,7 @@ def train_pilot(steps: int = 1500, res: int = 512, micro: int = 32, lr: float = 
     from transformers import CLIPTextModel, CLIPTokenizer
     from datasets import load_dataset
     from PIL import Image
-    from dreamlite.dit import DreamLiteDiT, DiTConfig, count_params
+    from hobby_image.dit import HobbyImageDiT, DiTConfig, count_params
     dev = "cuda"
 
     ae = AutoencoderDC.from_pretrained("mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers",
@@ -491,7 +491,7 @@ def train_pilot(steps: int = 1500, res: int = 512, micro: int = 32, lr: float = 
     lat = res // 32
     cfg = DiTConfig(in_channels=34, out_channels=32, latent_h=lat, panel_w=lat, patch=1,
                     d_model=1024, depth=16, heads=16, mlp_ratio=3.0, ctx_dim=768)  # CLIP-L = 768
-    model = DreamLiteDiT(cfg).to(dev)
+    model = HobbyImageDiT(cfg).to(dev)
     if resume:                                                 # continued pretraining: warm-start from a checkpoint
         ck = torch.load(resume, map_location=dev)
         sd = dict(ck["sd"])
@@ -714,11 +714,11 @@ def sample_gen(prompts: str = "", n_steps: int = 100, cfg: float = 5.0, res: int
     from diffusers import AutoencoderDC
     from transformers import CLIPTextModel, CLIPTokenizer
     from PIL import Image, ImageDraw
-    from dreamlite.dit import DreamLiteDiT, DiTConfig
+    from hobby_image.dit import HobbyImageDiT, DiTConfig
     dev = "cuda"
     ckpt = torch.load(f"/cache/{mdl or f'model_{res}'}.pt", map_location=dev)
     lat_std = ckpt["lat_std"]; sf = ckpt["sf"]
-    model = DreamLiteDiT(DiTConfig(**ckpt["cfg_dict"])).to(dev).eval()
+    model = HobbyImageDiT(DiTConfig(**ckpt["cfg_dict"])).to(dev).eval()
     model.load_state_dict(ckpt["sd"])
     ae = AutoencoderDC.from_pretrained("mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers",
                                        torch_dtype=torch.bfloat16).to(dev).eval()
@@ -788,11 +788,11 @@ def sample_edit(n: int = 6, n_steps: int = 50, cfg: float = 2.5, res: int = 512,
     from datasets import load_dataset
     from PIL import Image, ImageDraw, ImageFile
     ImageFile.LOAD_TRUNCATED_IMAGES = True
-    from dreamlite.dit import DreamLiteDiT, DiTConfig
+    from hobby_image.dit import HobbyImageDiT, DiTConfig
     dev = "cuda"
     ckpt = torch.load(f"/cache/{mdl}.pt", map_location=dev)
     lat_std = ckpt["lat_std"]; sf = ckpt["sf"]; lat = res // 32
-    model = DreamLiteDiT(DiTConfig(**ckpt["cfg_dict"])).to(dev).eval()
+    model = HobbyImageDiT(DiTConfig(**ckpt["cfg_dict"])).to(dev).eval()
     model.load_state_dict(ckpt["sd"])
     ae = AutoencoderDC.from_pretrained("mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers",
                                        torch_dtype=torch.bfloat16).to(dev).eval()
@@ -939,14 +939,14 @@ def cache_probe_a10g(res: int = 512, K: int = 512, lite: int = 0):
 def _probe_body(gpu: str, batches, steps, opt, ckpt):
     import os, sys, time, torch
     os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
-    from dreamlite.unet import DreamLiteUNet, V0_512, count_params
+    from hobby_image.unet import HobbyImageUNet, V0_512, count_params
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     cfg = V0_512
-    model = DreamLiteUNet(cfg).to(dev)
+    model = HobbyImageUNet(cfg).to(dev)
     chlast = bool(opt)
     if chlast:
         model = model.to(memory_format=torch.channels_last)
@@ -1016,11 +1016,11 @@ def _probe_body(gpu: str, batches, steps, opt, ckpt):
 def _dit_body(gpu: str, batches, steps, res):
     import os, sys, time, torch
     os.chdir("/root/moe-lab"); sys.path.insert(0, "/root/moe-lab")
-    from dreamlite.dit import DreamLiteDiT, V0_DCAE_512, V0_DCAE_256, count_params
+    from hobby_image.dit import HobbyImageDiT, V0_DCAE_512, V0_DCAE_256, count_params
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
     cfg = V0_DCAE_256 if int(res) == 256 else V0_DCAE_512
-    model = DreamLiteDiT(cfg).to(dev)
+    model = HobbyImageDiT(cfg).to(dev)
     run = torch.compile(model)
     opt_obj = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), fused=True)
     n = count_params(model)

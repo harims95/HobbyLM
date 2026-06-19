@@ -73,7 +73,7 @@ python -m modal run training/modal_train.py --action ablate --steps 3000  # run 
 ```
 
 Multimodal, tool-use, diffusion, and image-generation training live in `training/modal_mm.py`,
-`training/modal_tools.py`, `training/modal_dreamlite.py`, and the `dreamlite/` package.
+`training/modal_tools.py`, `training/modal_dreamlite.py`, and the `hobby_image/` package.
 
 ## Layout
 
@@ -87,7 +87,7 @@ eval/           tool-use and VLM eval harness runners
 tests/          smoke + integration tests
 docs/           architecture notes + plans
 assets/         small test fixtures (jfk.wav, test_dog.jpg)
-dreamlite/      text-to-image diffusion model package
+hobby_image/    text-to-image diffusion model package (DiT + U-Net)
 hobby-rs/       Rust CPU inference engine
 hobby-rs-cli/   standalone CLI build of the engine
 hobby-chat/     Tauri desktop app

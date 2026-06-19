@@ -135,7 +135,7 @@ class AttnBlock(nn.Module):
         return h.transpose(1, 2).reshape(B, C, H, W)
 
 
-class DreamLiteUNet(nn.Module):
+class HobbyImageUNet(nn.Module):
     def __init__(self, cfg: UNetConfig):
         super().__init__()
         self.cfg = cfg
@@ -245,7 +245,7 @@ V0_512 = UNetConfig(
 
 if __name__ == "__main__":
     cfg = V0_512
-    m = DreamLiteUNet(cfg)
+    m = HobbyImageUNet(cfg)
     n = count_params(m)
     print(f"DreamLite V0-512 U-Net: {n/1e6:.1f}M params (target ~390M)")
     x = torch.randn(1, cfg.in_channels, 64, 128)

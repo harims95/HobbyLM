@@ -103,7 +103,7 @@ class DiTBlock(nn.Module):
         return x
 
 
-class DreamLiteDiT(nn.Module):
+class HobbyImageDiT(nn.Module):
     def __init__(self, cfg: DiTConfig):
         super().__init__()
         self.cfg = cfg
@@ -164,7 +164,7 @@ V0_DCAE_256 = DiTConfig(in_channels=34, out_channels=32, latent_h=8, panel_w=8, 
 
 if __name__ == "__main__":
     for name, cfg in [("512", V0_DCAE_512), ("256", V0_DCAE_256)]:
-        m = DreamLiteDiT(cfg)
+        m = HobbyImageDiT(cfg)
         x = torch.randn(2, cfg.in_channels, cfg.latent_h, 2 * cfg.panel_w)
         t = torch.rand(2); ctx = torch.randn(2, 256, cfg.ctx_dim); task = torch.zeros(2, dtype=torch.long)
         with torch.no_grad():
