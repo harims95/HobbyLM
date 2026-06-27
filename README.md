@@ -1,37 +1,37 @@
-# HobbyLM-30M & 135M Looped Transformer
+# HobbyLM-30M
 
-A from-scratch language model family built on a hobby budget, forked from
-[rootxhacker/HobbyLM](https://github.com/harishsg993010/HobbyLM).
+A 31.9M parameter dense transformer built from scratch on a hobby budget,
+forked from [rootxhacker/HobbyLM](https://github.com/harishsg993010/HobbyLM).
 
-## Models
+## What we built
+A fully dense decoder-only transformer trained from scratch — every weight
+initialized randomly, trained on raw web text, no borrowed weights.
 
-### HobbyLM-30M (done ✅)
-- 31.9M parameter fully dense transformer
-- Trained on 1B tokens of FineWeb
-- 3800 steps, final val loss 3.9077
-- Architecture: 8 layers, d_model=384, 6 heads GQA, RoPE, RMSNorm, Muon optimizer
-- Weights: [harims95/HobbyLM-30M](https://huggingface.co/harims95/HobbyLM-30M)
+## Model
+- **Parameters:** 31.9M (fully dense, no MoE)
+- **Dataset:** FineWeb (1B tokens)
+- **Steps:** 3800
+- **Final val loss:** 3.9077
+- **Weights:** [harims95/HobbyLM-30M](https://huggingface.co/harims95/HobbyLM-30M)
 
-### HobbyLM-135M Looped (in progress 🔄)
-- 135M parameter looped transformer (same block runs K times per token)
-- Coming soon
-
-## What is a Looped Transformer?
-Instead of stacking N different layers, a looped transformer runs the
-same block K times. The model learns to iteratively refine its
-representations — closer to how reasoning actually works.
-
-## Training Stack
-- PyTorch + Modal serverless H100s
-- Muon optimizer + AdamW
-- FineWeb dataset
+## Architecture
+- 8 layers, d_model=384, 6 attention heads
+- GQA (2 kv-heads), RoPE, QK-norm, RMSNorm pre-norm
+- Tied embeddings, SwiGLU FFN
+- Muon optimizer (2D matrices) + AdamW (everything else)
 - bf16 + fused cross-entropy
 
-## Results
-| Model | Params | Tokens | Val Loss |
-|-------|--------|--------|----------|
-| HobbyLM-30M | 31.9M | 1B | 3.9077 |
-| HobbyLM-135M (soon) | 135M | TBD | TBD |
+## What we learned
+- How to design a transformer config from scratch and hit a param target
+- How the full training pipeline works end to end (data → train → eval → ship)
+- Muon optimizer beats AdamW on 2D weight matrices
+- At 30M params the model learns grammar and text style perfectly but
+  can't store factual knowledge — you need 10x more params for that
+- Modal makes running H100s from a laptop genuinely easy
+- Always use --detach so a dropped connection doesn't kill your run
+
+## Cost
+~$4 on Modal H100
 
 ## License
 Apache-2.0
